@@ -1,0 +1,411 @@
+"""Packed-bit kernels exposed through a stable C ABI."""
+
+from std.algorithm import parallelize
+from std.sys.info import simd_width_of
+
+comptime BPtr = UnsafePointer[UInt8, AnyOrigin[mut=True]]
+comptime W = simd_width_of[DType.uint8]()
+comptime PARALLEL_THRESHOLD = 128 << 20
+comptime PARALLEL_TASKS = 4
+
+
+def bit_mask(index: Int, little: Bool) -> UInt8:
+    var shift = index & 7
+    if not little:
+        shift = 7 - shift
+    return UInt8(1) << UInt8(shift)
+
+
+def get_bit(data: BPtr, index: Int, little: Bool) -> Bool:
+    return (data[index >> 3] & bit_mask(index, little)) != 0
+
+
+def put_bit(data: BPtr, index: Int, value: Bool, little: Bool):
+    var byte_index = index >> 3
+    var mask = bit_mask(index, little)
+    if value:
+        data[byte_index] |= mask
+    else:
+        data[byte_index] &= ~mask
+
+
+def pop_count(byte: UInt8) -> Int:
+    var v = byte
+    var count = 0
+    while v != 0:
+        v &= v - 1
+        count += 1
+    return count
+
+
+def pop_count64(value: UInt64) -> Int:
+    var v = value
+    v -= (v >> 1) & UInt64(0x5555555555555555)
+    v = (v & UInt64(0x3333333333333333)) + (
+        (v >> 2) & UInt64(0x3333333333333333)
+    )
+    v = (v + (v >> 4)) & UInt64(0x0F0F0F0F0F0F0F0F)
+    return Int((v * UInt64(0x0101010101010101)) >> 56)
+
+
+def clear_padding(data: BPtr, nbits: Int, little: Bool):
+    var remaining = nbits & 7
+    if remaining == 0 or nbits == 0:
+        return
+    var mask = UInt8((1 << remaining) - 1)
+    if not little:
+        mask <<= UInt8(8 - remaining)
+    data[nbits >> 3] &= mask
+
+
+def binary_range(
+    a: BPtr, b: BPtr, dst: BPtr, start: Int, stop: Int, operation: Int
+):
+    var i = start
+    if operation == 0:
+        while i + W <= stop:
+            dst.store(i, a.load[width=W](i) & b.load[width=W](i))
+            i += W
+        while i < stop:
+            dst[i] = a[i] & b[i]
+            i += 1
+    elif operation == 1:
+        while i + W <= stop:
+            dst.store(i, a.load[width=W](i) | b.load[width=W](i))
+            i += W
+        while i < stop:
+            dst[i] = a[i] | b[i]
+            i += 1
+    else:
+        while i + W <= stop:
+            dst.store(i, a.load[width=W](i) ^ b.load[width=W](i))
+            i += W
+        while i < stop:
+            dst[i] = a[i] ^ b[i]
+            i += 1
+
+
+def invert_range(src: BPtr, dst: BPtr, start: Int, stop: Int):
+    var i = start
+    while i + W <= stop:
+        dst.store(i, ~src.load[width=W](i))
+        i += W
+    while i < stop:
+        dst[i] = ~src[i]
+        i += 1
+
+
+@export("mba_binary")
+def mba_binary(
+    a_addr: Int, b_addr: Int, dst_addr: Int, nbytes: Int, operation: Int
+) abi("C"):
+    var a = BPtr(unsafe_from_address=a_addr)
+    var b = BPtr(unsafe_from_address=b_addr)
+    var dst = BPtr(unsafe_from_address=dst_addr)
+    if nbytes >= PARALLEL_THRESHOLD:
+        @parameter
+        def work(task: Int):
+            var start = (nbytes * task // PARALLEL_TASKS) // W * W
+            var stop = (
+                (nbytes * (task + 1) // PARALLEL_TASKS) // W * W
+                if task + 1 < PARALLEL_TASKS
+                else nbytes
+            )
+            binary_range(a, b, dst, start, stop, operation)
+
+        parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
+    else:
+        binary_range(a, b, dst, 0, nbytes, operation)
+
+
+@export("mba_invert")
+def mba_invert(
+    src_addr: Int, dst_addr: Int, nbytes: Int, nbits: Int, little_int: Int
+) abi("C"):
+    var src = BPtr(unsafe_from_address=src_addr)
+    var dst = BPtr(unsafe_from_address=dst_addr)
+    if nbytes >= PARALLEL_THRESHOLD:
+        @parameter
+        def work(task: Int):
+            var start = (nbytes * task // PARALLEL_TASKS) // W * W
+            var stop = (
+                (nbytes * (task + 1) // PARALLEL_TASKS) // W * W
+                if task + 1 < PARALLEL_TASKS
+                else nbytes
+            )
+            invert_range(src, dst, start, stop)
+
+        parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
+    else:
+        invert_range(src, dst, 0, nbytes)
+    clear_padding(dst, nbits, little_int != 0)
+
+
+@export("mba_count")
+def mba_count(src_addr: Int, nbytes: Int, nbits: Int) abi("C") -> Int:
+    var src = BPtr(unsafe_from_address=src_addr)
+    var total = 0
+    var i = 0
+    while i + 8 <= nbytes:
+        total += pop_count64(
+            (src + i).bitcast[UInt64]().load[alignment=1]()
+        )
+        i += 8
+    while i < nbytes:
+        total += pop_count(src[i])
+        i += 1
+    # Storage maintained by the Python layer has zero padding.
+    _ = nbits
+    return total
+
+
+@export("mba_count_binary")
+def mba_count_binary(
+    a_addr: Int, b_addr: Int, nbytes: Int, operation: Int
+) abi("C") -> Int:
+    var a = BPtr(unsafe_from_address=a_addr)
+    var b = BPtr(unsafe_from_address=b_addr)
+    var total = 0
+    var i = 0
+    if operation == 0:
+        while i + 8 <= nbytes:
+            var av = (a + i).bitcast[UInt64]().load[alignment=1]()
+            var bv = (b + i).bitcast[UInt64]().load[alignment=1]()
+            total += pop_count64(av & bv)
+            i += 8
+        while i < nbytes:
+            total += pop_count(a[i] & b[i])
+            i += 1
+    elif operation == 1:
+        while i + 8 <= nbytes:
+            var av = (a + i).bitcast[UInt64]().load[alignment=1]()
+            var bv = (b + i).bitcast[UInt64]().load[alignment=1]()
+            total += pop_count64(av | bv)
+            i += 8
+        while i < nbytes:
+            total += pop_count(a[i] | b[i])
+            i += 1
+    else:
+        while i + 8 <= nbytes:
+            var av = (a + i).bitcast[UInt64]().load[alignment=1]()
+            var bv = (b + i).bitcast[UInt64]().load[alignment=1]()
+            total += pop_count64(av ^ bv)
+            i += 8
+        while i < nbytes:
+            total += pop_count(a[i] ^ b[i])
+            i += 1
+    return total
+
+
+@export("mba_subset")
+def mba_subset(a_addr: Int, b_addr: Int, nbytes: Int) abi("C") -> Int:
+    var a = BPtr(unsafe_from_address=a_addr)
+    var b = BPtr(unsafe_from_address=b_addr)
+    for i in range(nbytes):
+        if (a[i] & ~b[i]) != 0:
+            return 0
+    return 1
+
+
+@export("mba_find")
+def mba_find(
+    src_addr: Int,
+    nbits: Int,
+    value_int: Int,
+    start: Int,
+    stop: Int,
+    little_int: Int,
+) abi("C") -> Int:
+    var src = BPtr(unsafe_from_address=src_addr)
+    var value = value_int != 0
+    var little = little_int != 0
+    var end = min(stop, nbits)
+    for i in range(max(start, 0), end):
+        if get_bit(src, i, little) == value:
+            return i
+    return -1
+
+
+@export("mba_shift")
+def mba_shift(
+    src_addr: Int,
+    dst_addr: Int,
+    nbits: Int,
+    amount: Int,
+    direction: Int,
+    little_int: Int,
+) abi("C"):
+    var src = BPtr(unsafe_from_address=src_addr)
+    var dst = BPtr(unsafe_from_address=dst_addr)
+    var little = little_int != 0
+    var nbytes = (nbits + 7) >> 3
+    if amount >= nbits:
+        for i in range(nbytes):
+            dst[i] = 0
+        return
+    var byte_shift = amount >> 3
+    var bit_shift = amount & 7
+    if direction == 0 and not little:
+        var stop = nbytes - byte_shift
+        var i = 0
+        if bit_shift == 0:
+            while i + W <= stop:
+                dst.store(i, src.load[width=W](i + byte_shift))
+                i += W
+        else:
+            while i + W < stop:
+                var source_index = i + byte_shift
+                dst.store(
+                    i,
+                    (src.load[width=W](source_index) << UInt8(bit_shift))
+                    | (
+                        src.load[width=W](source_index + 1)
+                        >> UInt8(8 - bit_shift)
+                    ),
+                )
+                i += W
+        while i < stop:
+            var source_index = i + byte_shift
+            var value = UInt16(src[source_index]) << UInt16(bit_shift)
+            if bit_shift != 0 and source_index + 1 < nbytes:
+                value |= UInt16(src[source_index + 1]) >> UInt16(8 - bit_shift)
+            dst[i] = UInt8(value)
+            i += 1
+        while i < nbytes:
+            dst[i] = 0
+            i += 1
+    elif direction == 0:
+        var stop = nbytes - byte_shift
+        var i = 0
+        if bit_shift == 0:
+            while i + W <= stop:
+                dst.store(i, src.load[width=W](i + byte_shift))
+                i += W
+        else:
+            while i + W < stop:
+                var source_index = i + byte_shift
+                dst.store(
+                    i,
+                    (src.load[width=W](source_index) >> UInt8(bit_shift))
+                    | (
+                        src.load[width=W](source_index + 1)
+                        << UInt8(8 - bit_shift)
+                    ),
+                )
+                i += W
+        while i < stop:
+            var source_index = i + byte_shift
+            var value = UInt16(src[source_index]) >> UInt16(bit_shift)
+            if bit_shift != 0 and source_index + 1 < nbytes:
+                value |= UInt16(src[source_index + 1]) << UInt16(8 - bit_shift)
+            dst[i] = UInt8(value)
+            i += 1
+        while i < nbytes:
+            dst[i] = 0
+            i += 1
+    elif not little:
+        var i = 0
+        while i < byte_shift:
+            dst[i] = 0
+            i += 1
+        if bit_shift != 0 and i < nbytes:
+            var source_index = i - byte_shift
+            var value = UInt16(src[source_index]) >> UInt16(bit_shift)
+            if bit_shift != 0 and source_index > 0:
+                value |= UInt16(src[source_index - 1]) << UInt16(8 - bit_shift)
+            dst[i] = UInt8(value)
+            i += 1
+        if bit_shift == 0:
+            while i + W <= nbytes:
+                dst.store(i, src.load[width=W](i - byte_shift))
+                i += W
+        else:
+            while i + W <= nbytes:
+                var source_index = i - byte_shift
+                dst.store(
+                    i,
+                    (src.load[width=W](source_index) >> UInt8(bit_shift))
+                    | (
+                        src.load[width=W](source_index - 1)
+                        << UInt8(8 - bit_shift)
+                    ),
+                )
+                i += W
+        while i < nbytes:
+            var source_index = i - byte_shift
+            var value = UInt16(src[source_index]) >> UInt16(bit_shift)
+            if bit_shift != 0 and source_index > 0:
+                value |= UInt16(src[source_index - 1]) << UInt16(8 - bit_shift)
+            dst[i] = UInt8(value)
+            i += 1
+    else:
+        var i = 0
+        while i < byte_shift:
+            dst[i] = 0
+            i += 1
+        if bit_shift != 0 and i < nbytes:
+            var source_index = i - byte_shift
+            var value = UInt16(src[source_index]) << UInt16(bit_shift)
+            if bit_shift != 0 and source_index > 0:
+                value |= UInt16(src[source_index - 1]) >> UInt16(8 - bit_shift)
+            dst[i] = UInt8(value)
+            i += 1
+        if bit_shift == 0:
+            while i + W <= nbytes:
+                dst.store(i, src.load[width=W](i - byte_shift))
+                i += W
+        else:
+            while i + W <= nbytes:
+                var source_index = i - byte_shift
+                dst.store(
+                    i,
+                    (src.load[width=W](source_index) << UInt8(bit_shift))
+                    | (
+                        src.load[width=W](source_index - 1)
+                        >> UInt8(8 - bit_shift)
+                    ),
+                )
+                i += W
+        while i < nbytes:
+            var source_index = i - byte_shift
+            var value = UInt16(src[source_index]) << UInt16(bit_shift)
+            if bit_shift != 0 and source_index > 0:
+                value |= UInt16(src[source_index - 1]) >> UInt16(8 - bit_shift)
+            dst[i] = UInt8(value)
+            i += 1
+    clear_padding(dst, nbits, little)
+
+
+@export("mba_reverse")
+def mba_reverse(
+    src_addr: Int, dst_addr: Int, nbits: Int, little_int: Int
+) abi("C"):
+    var src = BPtr(unsafe_from_address=src_addr)
+    var dst = BPtr(unsafe_from_address=dst_addr)
+    var little = little_int != 0
+    var nbytes = (nbits + 7) >> 3
+    for i in range(nbytes):
+        dst[i] = 0
+    for i in range(nbits):
+        put_bit(dst, i, get_bit(src, nbits - 1 - i, little), little)
+
+
+@export("mba_setall")
+def mba_setall(
+    dst_addr: Int, nbytes: Int, nbits: Int, value_int: Int, little_int: Int
+) abi("C"):
+    var dst = BPtr(unsafe_from_address=dst_addr)
+    var value = UInt8(255) if value_int != 0 else UInt8(0)
+    for i in range(nbytes):
+        dst[i] = value
+    clear_padding(dst, nbits, little_int != 0)
+
+
+@export("mba_bytereverse")
+def mba_bytereverse(dst_addr: Int, start: Int, stop: Int) abi("C"):
+    var dst = BPtr(unsafe_from_address=dst_addr)
+    for i in range(start, stop):
+        var v = dst[i]
+        v = ((v & 0x55) << 1) | ((v >> 1) & 0x55)
+        v = ((v & 0x33) << 2) | ((v >> 2) & 0x33)
+        dst[i] = (v << 4) | (v >> 4)
