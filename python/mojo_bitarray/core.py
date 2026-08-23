@@ -451,10 +451,10 @@ class bitarray:
         other = self._coerce_other(other)
         if other is NotImplemented:
             return NotImplemented
-        result = self if inplace else self.copy()
+        result = self if inplace else bitarray(self._nbits, endian=self._endian)
         if self._data:
             lib().mba_binary(
-                addr(result._data),
+                addr(self._data),
                 addr(other._data),
                 addr(result._data),
                 self.nbytes,
@@ -482,10 +482,10 @@ class bitarray:
         return self._binary(other, 2, True)
 
     def __invert__(self):
-        result = self.copy()
+        result = bitarray(self._nbits, endian=self._endian)
         if self._data:
             lib().mba_invert(
-                addr(result._data),
+                addr(self._data),
                 addr(result._data),
                 self.nbytes,
                 self._nbits,

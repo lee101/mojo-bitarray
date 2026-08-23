@@ -114,8 +114,23 @@ def test_shift_simd_tail(endian, n):
         assert_same(inplace_actual, inplace_expected)
 
 
+@pytest.mark.parametrize("endian", ["big", "little"])
+@pytest.mark.parametrize("n", [8 * 127 + 3, 8 * 128, 8 * 128 + 5, 8 * 129])
+def test_bitwise_simd_unroll_tail(endian, n):
+    rng = random.Random(3000 + n)
+    left = [rng.randrange(2) for _ in range(n)]
+    right = [rng.randrange(2) for _ in range(n)]
+    actual_a, expected_a = pair(left, endian)
+    actual_b, expected_b = pair(right, endian)
+
+    assert_same(actual_a & actual_b, expected_a & expected_b)
+    assert_same(actual_a | actual_b, expected_a | expected_b)
+    assert_same(actual_a ^ actual_b, expected_a ^ expected_b)
+    assert_same(~actual_a, ~expected_a)
+
+
 def test_parallel_threshold():
-    nbytes = 128 * 1024 * 1024
+    nbytes = 128 * 1024 * 1024 + 37
     actual_a = bitarray(b"\xaa" * nbytes)
     actual_b = bitarray(b"\xcc" * nbytes)
 

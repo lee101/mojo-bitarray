@@ -52,7 +52,7 @@ def mojo_version():
 
 def main():
     rng = np.random.default_rng(2026)
-    size = 8 * 1024 * 1024
+    size = int(os.environ.get("MOJO_BITARRAY_BENCH_MIB", "8")) * 1024 * 1024
     left_bytes = rng.integers(0, 256, size=size, dtype=np.uint8).tobytes()
     right_bytes = rng.integers(0, 256, size=size, dtype=np.uint8).tobytes()
     mojo_a, mojo_b = bitarray(left_bytes), bitarray(right_bytes)

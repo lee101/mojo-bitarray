@@ -1,9 +1,13 @@
 """Packed-bit kernels exposed through a stable C ABI."""
 
-from std.sys.info import simd_width_of
+from max.algorithm import parallelize
+from std.sys.info import simd_width_of as simdwidthof
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
-comptime W = simd_width_of[DType.uint8]()
+comptime U64Ptr = Pointer[UInt64, AnyOrigin[mut=True]]
+comptime W = simdwidthof[DType.float64]()
+comptime VECTOR_BYTES = W * 8
+comptime UNROLL = 4
 comptime PARALLEL_THRESHOLD = 128 << 20
 comptime PARALLEL_TASKS = 4
 
@@ -60,44 +64,120 @@ def clear_padding(data: BPtr, nbits: Int, little: Bool):
 def binary_range(
     a: BPtr, b: BPtr, dst: BPtr, start: Int, stop: Int, operation: Int
 ):
-    var i = start
+    var a64 = a.unsafe_offset(start).unsafe_bitcast[UInt64]()
+    var b64 = b.unsafe_offset(start).unsafe_bitcast[UInt64]()
+    var dst64 = dst.unsafe_offset(start).unsafe_bitcast[UInt64]()
+    var words = (stop - start) >> 3
+    var word = 0
     if operation == 0:
-        while i + W <= stop:
-            dst.unsafe_store(
-                i, a.unsafe_load[width=W](i) & b.unsafe_load[width=W](i)
+        while word + W * UNROLL <= words:
+            comptime for lane in range(UNROLL):
+                dst64.unsafe_store[alignment=1](
+                    word + lane * W,
+                    a64.unsafe_load[width=W, alignment=1](word + lane * W)
+                    & b64.unsafe_load[width=W, alignment=1](word + lane * W),
+                )
+            word += W * UNROLL
+        while word + W <= words:
+            dst64.unsafe_store[alignment=1](
+                word,
+                a64.unsafe_load[width=W, alignment=1](word)
+                & b64.unsafe_load[width=W, alignment=1](word),
             )
-            i += W
-        while i < stop:
-            dst[unsafe_offset=i] = a[unsafe_offset=i] & b[unsafe_offset=i]
-            i += 1
+            word += W
     elif operation == 1:
-        while i + W <= stop:
-            dst.unsafe_store(
-                i, a.unsafe_load[width=W](i) | b.unsafe_load[width=W](i)
+        while word + W * UNROLL <= words:
+            comptime for lane in range(UNROLL):
+                dst64.unsafe_store[alignment=1](
+                    word + lane * W,
+                    a64.unsafe_load[width=W, alignment=1](word + lane * W)
+                    | b64.unsafe_load[width=W, alignment=1](word + lane * W),
+                )
+            word += W * UNROLL
+        while word + W <= words:
+            dst64.unsafe_store[alignment=1](
+                word,
+                a64.unsafe_load[width=W, alignment=1](word)
+                | b64.unsafe_load[width=W, alignment=1](word),
             )
-            i += W
-        while i < stop:
-            dst[unsafe_offset=i] = a[unsafe_offset=i] | b[unsafe_offset=i]
-            i += 1
+            word += W
     else:
-        while i + W <= stop:
-            dst.unsafe_store(
-                i, a.unsafe_load[width=W](i) ^ b.unsafe_load[width=W](i)
+        while word + W * UNROLL <= words:
+            comptime for lane in range(UNROLL):
+                dst64.unsafe_store[alignment=1](
+                    word + lane * W,
+                    a64.unsafe_load[width=W, alignment=1](word + lane * W)
+                    ^ b64.unsafe_load[width=W, alignment=1](word + lane * W),
+                )
+            word += W * UNROLL
+        while word + W <= words:
+            dst64.unsafe_store[alignment=1](
+                word,
+                a64.unsafe_load[width=W, alignment=1](word)
+                ^ b64.unsafe_load[width=W, alignment=1](word),
             )
-            i += W
-        while i < stop:
+            word += W
+    var i = start + (word << 3)
+    while i < stop:
+        if operation == 0:
+            dst[unsafe_offset=i] = a[unsafe_offset=i] & b[unsafe_offset=i]
+        elif operation == 1:
+            dst[unsafe_offset=i] = a[unsafe_offset=i] | b[unsafe_offset=i]
+        else:
             dst[unsafe_offset=i] = a[unsafe_offset=i] ^ b[unsafe_offset=i]
-            i += 1
+        i += 1
 
 
 def invert_range(src: BPtr, dst: BPtr, start: Int, stop: Int):
-    var i = start
-    while i + W <= stop:
-        dst.unsafe_store(i, ~src.unsafe_load[width=W](i))
-        i += W
+    var src64 = src.unsafe_offset(start).unsafe_bitcast[UInt64]()
+    var dst64 = dst.unsafe_offset(start).unsafe_bitcast[UInt64]()
+    var words = (stop - start) >> 3
+    var word = 0
+    while word + W * UNROLL <= words:
+        comptime for lane in range(UNROLL):
+            dst64.unsafe_store[alignment=1](
+                word + lane * W,
+                ~src64.unsafe_load[width=W, alignment=1](word + lane * W),
+            )
+        word += W * UNROLL
+    while word + W <= words:
+        dst64.unsafe_store[alignment=1](
+            word,
+            ~src64.unsafe_load[width=W, alignment=1](word),
+        )
+        word += W
+    var i = start + (word << 3)
     while i < stop:
         dst[unsafe_offset=i] = ~src[unsafe_offset=i]
         i += 1
+
+
+def binary_parallel(a: BPtr, b: BPtr, dst: BPtr, nbytes: Int, operation: Int):
+    var chunk_size = ((nbytes + PARALLEL_TASKS - 1) // PARALLEL_TASKS)
+    chunk_size = (chunk_size + VECTOR_BYTES - 1) // VECTOR_BYTES * VECTOR_BYTES
+
+    @__parameter
+    def work(task: Int):
+        var start = task * chunk_size
+        var stop = min(start + chunk_size, nbytes)
+        if start < stop:
+            binary_range(a, b, dst, start, stop, operation)
+
+    parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
+
+
+def invert_parallel(src: BPtr, dst: BPtr, nbytes: Int):
+    var chunk_size = ((nbytes + PARALLEL_TASKS - 1) // PARALLEL_TASKS)
+    chunk_size = (chunk_size + VECTOR_BYTES - 1) // VECTOR_BYTES * VECTOR_BYTES
+
+    @__parameter
+    def work(task: Int):
+        var start = task * chunk_size
+        var stop = min(start + chunk_size, nbytes)
+        if start < stop:
+            invert_range(src, dst, start, stop)
+
+    parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
 
 
 @export("mba_binary")
@@ -108,12 +188,7 @@ def mba_binary(
     var b = BPtr(unsafe_from_address=b_addr)
     var dst = BPtr(unsafe_from_address=dst_addr)
     if nbytes >= PARALLEL_THRESHOLD:
-        for task in range(PARALLEL_TASKS):
-            var start = (nbytes * task // PARALLEL_TASKS) // W * W
-            var stop = (
-                nbytes * (task + 1) // PARALLEL_TASKS
-            ) // W * W if task + 1 < PARALLEL_TASKS else nbytes
-            binary_range(a, b, dst, start, stop, operation)
+        binary_parallel(a, b, dst, nbytes, operation)
     else:
         binary_range(a, b, dst, 0, nbytes, operation)
 
@@ -125,12 +200,7 @@ def mba_invert(
     var src = BPtr(unsafe_from_address=src_addr)
     var dst = BPtr(unsafe_from_address=dst_addr)
     if nbytes >= PARALLEL_THRESHOLD:
-        for task in range(PARALLEL_TASKS):
-            var start = (nbytes * task // PARALLEL_TASKS) // W * W
-            var stop = (
-                nbytes * (task + 1) // PARALLEL_TASKS
-            ) // W * W if task + 1 < PARALLEL_TASKS else nbytes
-            invert_range(src, dst, start, stop)
+        invert_parallel(src, dst, nbytes)
     else:
         invert_range(src, dst, 0, nbytes)
     clear_padding(dst, nbits, little_int != 0)

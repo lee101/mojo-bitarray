@@ -81,24 +81,28 @@ assert a.tobytes() == b"\xb2"
 
 Measured with `pixi run bench` on an Intel Xeon E5-2697 v4 at 2.30 GHz,
 Linux 6.8.0-136-generic, Python 3.13.14, Mojo
-1.0.0b3.dev2026072406 (ff9655c1), and upstream bitarray 3.8.0. Each row is the best of
+1.1.0.dev2026081105 (e929a99e), and upstream bitarray 3.8.0. Each row is the best of
 five runs on two 8 MiB packed vectors (67,108,864 bits). A value above `1.00x`
 in the last column means Mojo was faster.
 
 | operation | Mojo | upstream bitarray | upstream / Mojo |
 |---|---:|---:|---:|
-| count | 1.074 ms | 4.171 ms | 3.88x |
-| bitwise AND | 3.167 ms | 2.627 ms | 0.83x |
-| invert | 2.043 ms | 2.120 ms | 1.04x |
-| fused count_xor | 1.624 ms | 4.014 ms | 2.47x |
-| left shift by 13 | 3.657 ms | 5.150 ms | 1.41x |
+| count | 1.521 ms | 3.880 ms | 2.55x |
+| bitwise AND | 1.909 ms | 2.211 ms | 1.16x |
+| invert | 1.217 ms | 1.938 ms | 1.59x |
+| fused count_xor | 1.140 ms | 3.881 ms | 3.41x |
+| left shift by 13 | 3.847 ms | 4.201 ms | 1.09x |
 
-In this run Mojo was faster for count, inversion, fused XOR count, and
-shifting; upstream was faster for allocating AND. The fused count avoids
-allocating a result vector. These are measured results, not projected
-speedups.
+In this run Mojo was faster for every measured operation. The fused count
+avoids allocating a result vector. These are measured results, not projected
+speedups. A separate locked 128 MiB crossover run measured allocating AND at
+128.382 ms with four workers versus 146.613 ms serial, and inversion at
+121.306 ms versus 134.966 ms serial. Smaller inputs remain serial.
 
-There is intentionally no GPU path; this package only provides CPU kernels.
+There is intentionally no GPU path. These kernels perform at most one simple
+bitwise operation per byte while streaming two or three bytes, far below the
+roughly two-flops-per-byte arithmetic intensity needed to justify device
+transfer and launch overhead.
 
 ## How it works
 
@@ -116,7 +120,9 @@ library never retains a pointer and never allocates Python-visible memory.
 Calls retain the GIL and a live Python buffer export, so the owning bytearray
 cannot be resized while Mojo is using its address.
 Bitwise operations, inversion, and shifts process full SIMD vectors followed
-by a scalar tail. Shifts combine adjacent packed-byte vectors directly and
-clear only the bytes vacated by the shift. Very large bitwise and inversion
-calls use CPU workers; smaller buffers stay serial. All exports live in one
-Mojo compilation unit.
+by a scalar tail. Allocating bitwise and inversion operations write directly
+from the source into the new result buffer instead of copying the source first.
+Shifts combine adjacent packed-byte vectors directly and clear only the bytes
+vacated by the shift. Bitwise and inversion calls at 128 MiB and above use four
+CPU workers; smaller buffers stay serial. All exports live in one Mojo
+compilation unit.
