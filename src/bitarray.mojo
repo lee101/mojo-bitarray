@@ -1,6 +1,5 @@
 """Packed-bit kernels exposed through a stable C ABI."""
 
-from max.algorithm import parallelize
 from std.sys.info import simd_width_of as simdwidthof
 
 comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
@@ -156,28 +155,22 @@ def binary_parallel(a: BPtr, b: BPtr, dst: BPtr, nbytes: Int, operation: Int):
     var chunk_size = ((nbytes + PARALLEL_TASKS - 1) // PARALLEL_TASKS)
     chunk_size = (chunk_size + VECTOR_BYTES - 1) // VECTOR_BYTES * VECTOR_BYTES
 
-    @__parameter
-    def work(task: Int):
+    for task in range(PARALLEL_TASKS):
         var start = task * chunk_size
         var stop = min(start + chunk_size, nbytes)
         if start < stop:
             binary_range(a, b, dst, start, stop, operation)
-
-    parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
 
 
 def invert_parallel(src: BPtr, dst: BPtr, nbytes: Int):
     var chunk_size = ((nbytes + PARALLEL_TASKS - 1) // PARALLEL_TASKS)
     chunk_size = (chunk_size + VECTOR_BYTES - 1) // VECTOR_BYTES * VECTOR_BYTES
 
-    @__parameter
-    def work(task: Int):
+    for task in range(PARALLEL_TASKS):
         var start = task * chunk_size
         var stop = min(start + chunk_size, nbytes)
         if start < stop:
             invert_range(src, dst, start, stop)
-
-    parallelize[work](PARALLEL_TASKS, PARALLEL_TASKS)
 
 
 @export("mba_binary")
